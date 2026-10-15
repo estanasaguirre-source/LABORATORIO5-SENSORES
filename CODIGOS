@@ -1,0 +1,87 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ===== Pines ESP32 normal (DevKit con ESP-WROOM-32)
+const int PIN_V1    = 34;    // despues de R7 (ADC1, solo entrada)
+const int PIN_PULSO = 27;    // colector de Q1
+const int PIN_POT   = 35;    // potenciometro de velocidad (ADC1, solo entrada)
+const int PIN_PWM   = 25;    // compuerta del MOSFET (por 100 ohm)
+const int PIN_SDA   = 21, PIN_SCL = 22;   // LCD I2C
+
+const int      NUM_IMANES = 1;        // 2 si hay dos imanes a 180 grados
+const uint32_t FREC_PWM   = 20000;    // 1000 si el diodo del motor es 1N4007
+const int64_t  TIMEOUT_US = 6000000;  // sin pulsos en 6 s -> 0 RPM
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // si no muestra nada, prueba 0x3F
+
+const int N = 8;                      // ultimas 8 vueltas para la mediana
+volatile uint32_t periodos[N];
+volatile uint8_t  idx = 0, validos = 0;
+volatile int64_t  tAnterior = 0, tUltimo = 0;
+
+void IRAM_ATTR alPulso() {            // flanco de bajada = paso del iman
+  int64_t t = esp_timer_get_time();   // microsegundos
+  if (tAnterior == 0) { tAnterior = t; tUltimo = t; return; }
+  uint32_t p = (uint32_t)(t - tAnterior);
+  if (p < 20000) return;              // ignora ruido: pulsos a menos de 20 ms
+  periodos[idx] = p;
+  idx = (idx + 1) % N;
+  if (validos < N) validos++;
+  tAnterior = t;
+  tUltimo = t;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_PULSO, INPUT);                    // R9 hace el pull-up a 3,3 V
+  attachInterrupt(digitalPinToInterrupt(PIN_PULSO), alPulso, FALLING);
+  analogSetPinAttenuation(PIN_V1, ADC_11db);    // rango ~0 a 3,1 V
+  analogSetPinAttenuation(PIN_POT, ADC_11db);
+  ledcAttach(PIN_PWM, FREC_PWM, 10);            // PWM de 10 bits
+  ledcWrite(PIN_PWM, 0);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Tacometro Hall");
+  delay(1000);
+  lcd.clear();
+}
+
+void loop() {
+  // 1) Velocidad del motor con el potenciometro
+  int pot = analogRead(PIN_POT);                // 0 a 4095
+  ledcWrite(PIN_PWM, pot >> 2);                 // 0 a 1023
+
+  // 2) Copia segura de los datos de la interrupcion
+  uint32_t copia[N];
+  noInterrupts();
+  uint8_t n = validos;
+  for (int i = 0; i < n; i++) copia[i] = periodos[i];
+  int64_t tu = tUltimo;
+  interrupts();
+
+  // 3) RPM = 60 / (T * imanes), con T = mediana de las ultimas vueltas
+  //    (la mediana ignora un pulso perdido o uno falso; un promedio no)
+  float rpm = 0;
+  if (esp_timer_get_time() - tu > TIMEOUT_US) {     // motor parado
+    noInterrupts(); validos = 0; tAnterior = 0; interrupts();
+  } else if (n > 0) {
+    for (int i = 1; i < n; i++) {               // ordenar (n <= 8)
+      uint32_t v = copia[i]; int j = i - 1;
+      while (j >= 0 && copia[j] > v) { copia[j + 1] = copia[j]; j--; }
+      copia[j + 1] = v;
+    }
+    float T = (n % 2) ? copia[n / 2]
+                      : (copia[n / 2 - 1] + copia[n / 2]) / 2.0f;   // microsegundos
+    rpm = 60e6f / (T * NUM_IMANES);
+  }
+  rpm = roundf(rpm * 2) / 2;                    // pasos de 0,5 RPM
+
+  // 4) Pantalla y monitor serie
+  uint32_t v1 = analogReadMilliVolts(PIN_V1);
+  int pwm = (pot * 100) / 4095;
+  lcd.setCursor(0, 0); lcd.printf("%7.1f RPM      ", rpm);
+  lcd.setCursor(0, 1); lcd.printf("V1:%4umV  %3d%%", (unsigned)v1, pwm);
+  Serial.printf("%.1f,%u,%d\n", rpm, (unsigned)v1, pwm);   // RPM, V1 (mV), PWM (%)
+  delay(200);
+}
